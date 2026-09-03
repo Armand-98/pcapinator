@@ -183,3 +183,42 @@ def test_score_group_reports_every_component():
     assert 0.0 <= beacon.coverage_score <= 1.0
     assert beacon.bytes_out == sum(f.bytes_out for f in flows)
     assert "every" in beacon.describe()
+
+
+def test_extra_connections_per_checkin_pull_the_period_to_a_submultiple():
+    """A known limitation, pinned so it cannot regress into a silent claim.
+
+    These are the real inter-connection gaps from an SSLoad C2 conversation
+    (malware-traffic-analysis.net, 2024-04-18), whose scheduled task ran every
+    ten minutes. Some check-ins open two connections, so 603s and 595s each
+    arrive split in two. The true period rejects those short gaps and scores
+    agreement 0.6; the submultiple 600/3 folds nearly all of them and wins.
+
+    The conversation is still detected, and detection is what matters. The
+    reported period is a third of the truth, so it is evidence to read rather
+    than a measurement to trust.
+    """
+    gaps = [579.9, 601.8, 593.0, 228.0, 375.0, 600.1, 606.9, 430.0, 165.0, 595.0]
+    starts, now = [1000.0], 1000.0
+    for gap in gaps:
+        now += gap
+        starts.append(now)
+
+    beacon = only(find_beacons(make_flows(starts), min_connections=8))
+    assert beacon.score > 0.9, "the conversation must still be flagged"
+    assert beacon.period == pytest.approx(600.0 / 3, abs=15.0)
+    assert beacon.period != pytest.approx(600.0, abs=60.0)
+
+
+def test_a_clean_ten_minute_schedule_is_measured_correctly():
+    """The same capture's Telegram conversation, one connection per check-in,
+    where the ten minute period is recovered exactly."""
+    gaps = [586.8, 602.0, 593.0, 603.0, 600.0, 607.0, 595.0, 595.0]
+    starts, now = [1000.0], 1000.0
+    for gap in gaps:
+        now += gap
+        starts.append(now)
+
+    beacon = only(find_beacons(make_flows(starts), min_connections=8))
+    assert beacon.period == pytest.approx(600.0, abs=10.0)
+    assert beacon.score > 0.9

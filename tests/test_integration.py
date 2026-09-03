@@ -239,3 +239,61 @@ def test_benign_periodic_traffic_is_reported_and_scoped_not_suppressed(tmp_path)
 def test_destination_scope_classification(address, expected):
     from pcapinator.detect.beacon import scope
     assert scope(address) == expected
+
+
+# --- vantage point ---------------------------------------------------------
+
+def test_declared_local_network_overrides_the_default_scope():
+    """A capture from an internet facing server contains no RFC 1918 addresses,
+    so the default rule calls every address external, including the server's
+    own. The analyst has to be able to say which addresses are theirs."""
+    import ipaddress
+    from pcapinator.detect.beacon import is_local, scope
+
+    server = [ipaddress.ip_network("203.161.44.208/32")]
+    assert scope("203.161.44.208") == "external"
+    assert scope("203.161.44.208", server) == "private"
+    assert scope("92.255.85.52", server) == "external"
+    assert is_local("203.161.44.208", server)
+    assert not is_local("92.255.85.52", server)
+
+
+def test_inbound_schedules_are_dropped_once_the_network_is_declared(tmp_path):
+    """Beaconing is a host inside the network calling out. An external host
+    probing the network on a schedule is somebody else's cron job, and on an
+    internet facing capture there are hundreds of them."""
+    import ipaddress
+    from pcapinator.cli import analyse
+    from pcapinator.synth import Scenario, tcp_session
+
+    outbound, inbound = [], []
+    for index in range(30):
+        outbound += tcp_session(1000.0 + index * 60.0, "10.0.0.5", "203.0.113.9",
+                                40000 + index, 443, 512, response_size=64)
+        inbound += tcp_session(1000.0 + index * 90.0, "198.51.100.7", "10.0.0.5",
+                               41000 + index, 8080, 256, response_size=64)
+    path = Scenario("both", outbound + inbound).write(tmp_path / "both.pcap")
+
+    everything = analyse(path)
+    assert {f.src for f in everything.findings if f.kind == "beacon"} == {
+        "10.0.0.5", "198.51.100.7"}
+
+    ours = analyse(path, local_nets=(ipaddress.ip_network("10.0.0.0/24"),))
+    assert {f.src for f in ours.findings if f.kind == "beacon"} == {"10.0.0.5"}
+
+
+def test_top_reports_what_it_omitted(tmp_path):
+    """Bounding output is fine; hiding the bound is not. A truncated list that
+    does not say it was truncated reads as complete coverage."""
+    from pcapinator.report import Finding, Summary, render_text
+
+    summary = Summary(capture="x.pcap")
+    summary.findings = [
+        Finding(kind="beacon", title=f"finding {i}", score=0.9 - i * 0.01,
+                severity="high", src="10.0.0.5", dst=f"203.0.113.{i}")
+        for i in range(10)
+    ]
+    text = render_text(summary, colour=False, limit=3)
+    assert "showing 3 of 10, 7 omitted by --top" in text
+    assert "finding 9" not in text
+    assert "finding 0" in text

@@ -1,11 +1,13 @@
-"""Character bigram model of human-chosen names. GENERATED, do not edit.
+"""Character model of human-chosen names. GENERATED, do not edit.
 
 Built by tools/build_bigrams.py from /usr/share/dict/words (234428 words, 2483044 bigrams).
-Natural log of P(next | previous) over the alphabet "^" plus a-z, where "^" is
-the word boundary, Laplace smoothed with alpha=1 so an unseen pair costs
--12.37 nats rather than negative infinity.
+LOG_PROB is the natural log of P(next | previous) over the alphabet "^" plus
+a-z, where "^" is the word boundary, Laplace smoothed with alpha=1 so an
+unseen pair costs -12.37 nats rather than negative infinity. LETTER_LOG_PROB is
+the marginal log P(letter): which letters get chosen, ignoring their order.
 
-Index a transition as LOG_PROB[INDEX[prev]][INDEX[next]].
+Index a transition as LOG_PROB[INDEX[prev]][INDEX[next]] and a letter's
+marginal as LETTER_LOG_PROB[ord(char) - 97].
 """
 
 ALPHABET = '^abcdefghijklmnopqrstuvwxyz'
@@ -67,4 +69,11 @@ LOG_PROB = (
     (-0.6227, -3.5791, -5.1829, -3.4175, -3.8123, -3.9908, -5.8865, -4.2427, -5.7742, -4.4197, -9.4631, -6.9782, -2.8447, -3.3566, -3.4157, -3.7153, -2.9580, -9.0576, -3.4867, -3.0842, -3.4463, -5.9441, -7.9590, -5.5362, -5.7374, -9.2399, -5.9441),
     # z
     (-4.0798, -1.6227, -6.4777, -6.7400, -6.2700, -0.8531, -7.9440, -6.9632, -6.9632, -2.4844, -9.0426, -7.4332, -4.1906, -7.2509, -7.4332, -1.7998, -7.6563, -9.0426, -6.8454, -6.9632, -6.6447, -4.6482, -7.9440, -6.7400, -9.0426, -3.2285, -3.4368),
+)
+
+# marginal log P(letter), a to z
+LETTER_LOG_PROB = (
+    -2.4278, -4.0234, -3.0830, -3.4987, -2.2602, -4.5354, -3.8700, -3.5571, -2.4181,
+    -6.5828, -4.9425, -2.8505, -3.4639, -2.6545, -2.5814, -3.3627, -6.4052, -2.6409,
+    -2.7834, -2.6924, -3.2515, -4.7167, -5.0924, -5.7867, -3.7770, -5.5863,
 )

@@ -5,11 +5,14 @@ Source: /usr/share/dict/words (the BSD web2 list, 235976 entries), the same
 list present on any macOS or BSD host. Only ASCII alphabetic entries of two or
 more characters are used, lowercased.
 
-The table is a 27x27 matrix of natural log conditional probabilities
-P(next | previous) over a boundary symbol plus a to z. Row 0 and column 0 are
-the boundary, so a word contributes ^f, fo, oo, ... , od$. Counts are Laplace
-smoothed, which is what keeps an unseen pair finite: it costs about -12 nats
-instead of -inf, a heavy but bounded penalty.
+Two tables are emitted. LOG_PROB is a 27x27 matrix of natural log conditional
+probabilities P(next | previous) over a boundary symbol plus a to z. Row 0 and
+column 0 are the boundary, so a word contributes ^f, fo, oo, ... , od$.
+LETTER_LOG_PROB is the marginal log P(letter) over the same corpus: which
+letters a human reaches for, independent of the order they are put in.
+
+Counts are Laplace smoothed, which is what keeps an unseen pair finite: it costs
+about -12 nats instead of -inf, a heavy but bounded penalty.
 
 Deterministic: sorted input, integer counts, values rounded to 4 decimals.
 
@@ -30,14 +33,16 @@ ALPHA = 1.0   # Laplace smoothing weight
 DEFAULT_WORDLIST = Path("/usr/share/dict/words")
 DEFAULT_OUTPUT = Path(__file__).resolve().parent.parent / "src/pcapinator/detect/bigrams.py"
 
-HEADER = '''"""Character bigram model of human-chosen names. GENERATED, do not edit.
+HEADER = '''"""Character model of human-chosen names. GENERATED, do not edit.
 
 Built by tools/build_bigrams.py from {source} ({words} words, {pairs} bigrams).
-Natural log of P(next | previous) over the alphabet "^" plus a-z, where "^" is
-the word boundary, Laplace smoothed with alpha={alpha:g} so an unseen pair costs
-{floor:.2f} nats rather than negative infinity.
+LOG_PROB is the natural log of P(next | previous) over the alphabet "^" plus
+a-z, where "^" is the word boundary, Laplace smoothed with alpha={alpha:g} so an
+unseen pair costs {floor:.2f} nats rather than negative infinity. LETTER_LOG_PROB is
+the marginal log P(letter): which letters get chosen, ignoring their order.
 
-Index a transition as LOG_PROB[INDEX[prev]][INDEX[next]].
+Index a transition as LOG_PROB[INDEX[prev]][INDEX[next]] and a letter's
+marginal as LETTER_LOG_PROB[ord(char) - 97].
 """
 
 ALPHABET = {alphabet!r}
@@ -58,15 +63,23 @@ def read_words(path: Path) -> list[str]:
     return sorted(words)
 
 
-def count_bigrams(words: list[str]) -> tuple[list[list[int]], int]:
+def count_bigrams(words: list[str]) -> tuple[list[list[int]], list[int], int]:
     counts = [[0] * SIZE for _ in range(SIZE)]
+    letters = [0] * 26
     pairs = 0
     for word in words:
         symbols = "^" + word + "^"
         for prev, nxt in zip(symbols, symbols[1:]):
             counts[INDEX[prev]][INDEX[nxt]] += 1
             pairs += 1
-    return counts, pairs
+        for char in word:
+            letters[ord(char) - 97] += 1
+    return counts, letters, pairs
+
+
+def to_letter_log_probs(letters: list[int]) -> list[float]:
+    total = sum(letters) + ALPHA * 26
+    return [round(math.log((value + ALPHA) / total), 4) for value in letters]
 
 
 def to_log_probs(counts: list[list[int]]) -> list[list[float]]:
@@ -77,13 +90,17 @@ def to_log_probs(counts: list[list[int]]) -> list[list[float]]:
     return table
 
 
-def render(table: list[list[float]], source: Path, words: int, pairs: int,
-           floor: float) -> str:
+def render(table: list[list[float]], letters: list[float], source: Path,
+           words: int, pairs: int, floor: float) -> str:
     out = [HEADER.format(source=source, words=words, pairs=pairs, alpha=ALPHA,
                          floor=floor, alphabet=ALPHABET)]
     for pos, row in enumerate(table):
         values = ", ".join(f"{value:.4f}" for value in row)
         out.append(f"    # {ALPHABET[pos]}\n    ({values}),\n")
+    out.append(")\n\n# marginal log P(letter), a to z\nLETTER_LOG_PROB = (\n")
+    for start in range(0, 26, 9):
+        chunk = letters[start:start + 9]
+        out.append("    " + ", ".join(f"{value:.4f}" for value in chunk) + ",\n")
     out.append(")\n")
     return "".join(out)
 
@@ -103,12 +120,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no usable words in {args.wordlist}", file=sys.stderr)
         return 1
 
-    counts, pairs = count_bigrams(words)
+    counts, letter_counts, pairs = count_bigrams(words)
     table = to_log_probs(counts)
+    letters = to_letter_log_probs(letter_counts)
     # Worst case cost of a pair the wordlist never showed, taken from the
     # busiest row: that row's smoothing mass is spread thinnest.
     floor = min(min(row) for row in table)
-    args.output.write_text(render(table, args.wordlist, len(words), pairs, floor))
+    args.output.write_text(
+        render(table, letters, args.wordlist, len(words), pairs, floor))
     return 0
 
 

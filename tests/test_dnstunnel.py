@@ -13,8 +13,8 @@ import pytest
 
 from pcapinator.detect.dnstunnel import find_tunnels
 from pcapinator.dnsview import DnsEvent
-from pcapinator.layers.dns import (QTYPE_A, QTYPE_CNAME, QTYPE_NULL, QTYPE_TXT,
-                                   RCODE_NXDOMAIN)
+from pcapinator.layers.dns import (QTYPE_A, QTYPE_CNAME, QTYPE_NULL, QTYPE_PTR,
+                                   QTYPE_SRV, QTYPE_TXT, RCODE_NXDOMAIN)
 
 CLIENT = "10.0.0.42"
 SERVER = "10.0.0.1"
@@ -113,6 +113,61 @@ def long_hostname_names(count, *, seed):
              "staging-payment-processor-us-east-2-internal",
              "prod-message-queue-broker-ap-south-1-internal"]
     return [f"{rng.choice(hosts)}.svc.corp.example.com" for _ in range(count)]
+
+
+def mdns_names(count, *, seed):
+    """Bonjour instance names: device UUIDs and MAC addresses under _tcp.local.
+
+    Every Apple and Google device on a segment advertises one, so a capture
+    that includes port 5353 sees hundreds of unique, near-maximal-entropy
+    names of tunnel length under a single shared parent.
+    """
+    rng = random.Random(seed)
+    services = ["_googlecast", "_raop", "_airplay", "_companion-link",
+                "_homekit", "_sonos"]
+    names = []
+    for _ in range(count):
+        if rng.random() < 0.5:
+            instance = f"Chromecast-{encode(rng, HEX, 32)}"
+        else:
+            instance = f"{encode(rng, HEX, 12).upper()}@Room {rng.randrange(400)}"
+        names.append(f"{instance}.{rng.choice(services)}._tcp.local")
+    return names
+
+
+def k8s_names(count, *, seed, suffix="svc.cluster.local"):
+    """Generated Kubernetes pod names: long, unique per pod, high entropy."""
+    rng = random.Random(seed)
+    deployments = ["payments-api-gateway-canary", "checkout-orchestrator-worker",
+                   "identity-session-service", "ledger-reconciliation-batch"]
+    namespaces = ["production", "staging", "payments-team"]
+    return [f"{rng.choice(deployments)}-{encode(rng, HEX, 10)}"
+            f"-{encode(rng, B32, 5)}.{rng.choice(namespaces)}.{suffix}"
+            for _ in range(count)]
+
+
+def enterprise_names(count, *, seed):
+    """A blend of ordinary enterprise chatter that superficially fans out."""
+    rng = random.Random(seed)
+    names = []
+    for _ in range(count):
+        pick = rng.randrange(4)
+        if pick == 0:      # monitoring polling every host on a /16
+            names.append(f"host-{rng.randrange(65536):05d}.dc1.mon.example.net")
+        elif pick == 1:    # inbound DKIM verification, one sender per mail
+            names.append(f"{rng.choice(['s1', 'selector1', 'k1', '20230601'])}"
+                         f"._domainkey.sender{rng.randrange(4000)}.example.org")
+        elif pick == 2:    # anti-bot vendor, one session hostname per page
+            names.append(f"{encode(rng, B32, 32)}.challenges.example-cdn.com")
+        else:              # ad tech identity sync
+            names.append(f"{encode(rng, B32, 22)}.px.example-ads.com")
+    return names
+
+
+def ipfs_names(count, *, seed):
+    """Content addressed gateway: a base32 CID per object, one per query."""
+    rng = random.Random(seed)
+    return [f"bafybei{encode(rng, B32, 52)}.ipfs.dweb.link" for _ in range(count)]
 
 
 def scored(events, parent):
@@ -371,3 +426,145 @@ def test_large_capture_is_bounded_and_deterministic():
     second = find_tunnels(events)
     assert first == second
     assert only(first).queries == 5000
+
+
+# --- false positives: enterprise traffic the capacity gate alone does not stop
+
+def test_mdns_bonjour_chatter_is_not_a_tunnel():
+    """A Chromecast instance name is 44 encoded characters of device UUID.
+
+    dnsview lifts port 5353, so this is traffic the detector really sees. It
+    reaches tunnel capacity and near perfect cardinality; only the fact that
+    .local is answered on the link, never by an attacker's nameserver, says it
+    is not an exfiltration channel.
+    """
+    events = conversation(mdns_names(700, seed=101), qtype=QTYPE_PTR, gap=0.2,
+                          respond=False)
+    assert find_tunnels(events, threshold=0.0) == []
+
+
+def test_kubernetes_pod_dns_is_not_a_tunnel():
+    """Generated pod names are long, unique per pod and high entropy.
+
+    A busy cluster of short lived pods produces one fresh 54 character name
+    per query under one parent, which is the exact shape of a tunnel.
+    """
+    events = conversation(k8s_names(600, seed=102), gap=0.05)
+    assert find_tunnels(events, threshold=0.0) == []
+
+
+def test_cloud_internal_hostnames_are_not_tunnels():
+    rng = random.Random(103)
+    names = [f"ip-10-{rng.randrange(256)}-{rng.randrange(256)}"
+             f"-{rng.randrange(256)}.eu-west-1.compute.internal"
+             for _ in range(800)]
+    assert find_tunnels(conversation(names, gap=0.05), threshold=0.0) == []
+
+
+def test_locally_scoped_parents_are_matched_case_insensitively():
+    """A capture is not obliged to send the suffix in lower case."""
+    names = [name.upper() for name in k8s_names(400, seed=104)]
+    assert find_tunnels(conversation(names, gap=0.05), threshold=0.0) == []
+
+
+def test_enterprise_fan_out_is_not_a_tunnel():
+    """Monitoring, DKIM verification, anti-bot and ad tech identity hostnames.
+
+    All four fan out to thousands of distinct names under a shared parent;
+    none of them has room in a name for a payload.
+    """
+    events = conversation(enterprise_names(1200, seed=105), gap=0.05)
+    assert find_tunnels(events) == []
+    for parent in ("example.net", "example.org", "example-cdn.com",
+                   "example-ads.com"):
+        tunnel = scored(events, parent)
+        assert tunnel is None or tunnel.score < 0.4, parent
+
+
+def test_content_addressed_gateway_is_a_known_false_positive():
+    """Documented limitation, asserted so it cannot regress silently.
+
+    An IPFS subdomain gateway names each object by its 59 character base32
+    content id, which is ~270 bits per query under a fixed parent: the same
+    capacity as a tunnel, for the same reason. Nothing in the traffic
+    separates them; only an allowlist does.
+    """
+    events = conversation(ipfs_names(300, seed=106), gap=0.3)
+    assert only(find_tunnels(events)).parent == "dweb.link"
+
+
+# --- evasion ---------------------------------------------------------------
+
+def test_small_alphabet_encoding_does_not_escape_detection():
+    """Capacity, not per character entropy, has to be the gate.
+
+    A floor on bits per character is escaped by encoding in base 8: 189
+    characters of octal is 567 bits a query, more payload than the base32
+    tunnel above, at under 3 bits per character.
+    """
+    rng = random.Random(107)
+    names = [".".join(encode(rng, "01234567", 63) for _ in range(3))
+             + ".t.oct-c2.net" for _ in range(200)]
+    tunnel = only(find_tunnels(conversation(names, qtype=QTYPE_NULL, gap=0.5)))
+    assert tunnel.entropy < 3.0
+    assert tunnel.bits_per_query > 500
+    assert tunnel.score > 0.8
+
+
+def test_decimal_encoding_does_not_escape_detection():
+    rng = random.Random(108)
+    names = [".".join(encode(rng, "0123456789", 63) for _ in range(3))
+             + ".t.dec-c2.net" for _ in range(200)]
+    assert only(find_tunnels(conversation(names, qtype=QTYPE_NULL, gap=0.5)))
+
+
+def test_case_randomised_parent_does_not_split_a_tunnel():
+    """Resolution is case insensitive, so varying the suffix costs nothing.
+
+    This is also what a capture upstream of a 0x20 encoding resolver looks
+    like, where the resolver itself randomises the case of every name.
+    """
+    rng = random.Random(109)
+    names = []
+    for name in tunnel_names(300, seed=110):
+        names.append("".join(c.upper() if rng.random() < 0.5 else c
+                             for c in name))
+    tunnel = only(find_tunnels(conversation(names, qtype=QTYPE_NULL, gap=0.4)))
+    assert tunnel.parent == "tun-c2.net"
+    assert tunnel.unique_subdomains == 300
+
+
+def test_duplicate_padding_does_not_hide_a_tunnel():
+    """Padding with repeats dilutes the unique ratio but not the data sent.
+
+    Cardinality is a ratio, so an attacker who re-asks each encoded name ten
+    times drives it to zero for free. Novelty measures the distinct content
+    the parent has carried, which padding cannot reduce.
+    """
+    names = tunnel_names(300, seed=111)
+    padded = [name for name in names for _ in range(10)]
+    tunnel = only(find_tunnels(conversation(padded, qtype=QTYPE_NULL, gap=0.2)))
+    assert tunnel.queries == 3000
+    assert tunnel.unique_subdomains == 300
+    assert tunnel.score > 0.85
+
+
+def test_repeated_names_do_not_inflate_the_upload_estimate():
+    """A cached name asked again carries no new bytes, so it is not counted."""
+    names = tunnel_names(200, seed=112)
+    once = only(find_tunnels(conversation(names, qtype=QTYPE_NULL, gap=0.5)))
+    twice = only(find_tunnels(conversation([n for n in names for _ in range(2)],
+                                           qtype=QTYPE_NULL, gap=0.25)))
+    assert twice.upload_bytes == pytest.approx(once.upload_bytes, rel=0.02)
+
+
+def test_short_chunked_tunnel_evades_the_capacity_gate():
+    """Documented limitation, asserted so the honest bound is the tested one.
+
+    18 base32 characters is 66 bits a query, about 11 bytes. Below the gate,
+    and that region holds every CDN, GUID and session hostname there is, so it
+    cannot be reclaimed by lowering the gate.
+    """
+    rng = random.Random(113)
+    names = [f"{encode(rng, B32, 18)}.t.slow-c2.net" for _ in range(600)]
+    assert find_tunnels(conversation(names, qtype=QTYPE_NULL, gap=0.2)) == []

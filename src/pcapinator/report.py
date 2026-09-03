@@ -116,7 +116,7 @@ def render_json(summary: Summary) -> str:
 
 
 def render_text(summary: Summary, *, colour: bool | None = None,
-                width: int = 78) -> str:
+                limit: int | None = None) -> str:
     colour = use_colour() if colour is None else colour
     paint = _painter(colour)
     lines: list[str] = []
@@ -129,6 +129,7 @@ def render_text(summary: Summary, *, colour: bool | None = None,
     lines.append("")
 
     findings = summary.ranked()
+    shown = findings if limit is None else findings[:limit]
     if not findings:
         lines.append("  No findings.")
         lines.append(paint(
@@ -141,9 +142,12 @@ def render_text(summary: Summary, *, colour: bool | None = None,
     tally = "  ".join(f"{paint(name, _COLOURS[name])} {counts[name]}"
                       for name in (CRITICAL, HIGH, MEDIUM, LOW) if name in counts)
     lines.append(f"  {tally}")
+    if len(shown) < len(findings):
+        lines.append(paint(f"  showing {len(shown)} of {len(findings)}, "
+                           f"{len(findings) - len(shown)} omitted by --top", _DIM))
     lines.append("")
 
-    for finding in findings:
+    for finding in shown:
         tag = paint(f"[{finding.severity.upper()}]", _COLOURS[finding.severity])
         lines.append(f"  {tag} {paint(finding.title, _BOLD)}")
         detail = f"score {finding.score:.2f}"

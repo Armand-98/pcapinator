@@ -106,7 +106,8 @@ class Beacon:
 
 
 def find_beacons(flows: Iterable[Flow], *, threshold: float = 0.7,
-                 min_connections: int = MIN_CONNECTIONS) -> list[Beacon]:
+                 min_connections: int = MIN_CONNECTIONS,
+                 local_nets: Sequence = ()) -> list[Beacon]:
     """Score every conversation and return those that look scheduled, worst first."""
     grouped: dict[tuple[str, str, int, int], list[Flow]] = defaultdict(list)
     for flow in flows:
@@ -118,7 +119,8 @@ def find_beacons(flows: Iterable[Flow], *, threshold: float = 0.7,
     found = []
     for (src, dst, dport, proto), group in grouped.items():
         beacon = score_group(src, dst, dport, proto, group, window,
-                             min_connections=min_connections)
+                             min_connections=min_connections,
+                             local_nets=local_nets)
         if beacon is not None and beacon.score >= threshold:
             found.append(beacon)
     found.sort(key=lambda b: b.score, reverse=True)
@@ -127,7 +129,8 @@ def find_beacons(flows: Iterable[Flow], *, threshold: float = 0.7,
 
 def score_group(src: str, dst: str, dport: int, proto: int,
                 flows: Sequence[Flow], window: float, *,
-                min_connections: int = MIN_CONNECTIONS) -> Beacon | None:
+                min_connections: int = MIN_CONNECTIONS,
+                local_nets: Sequence = ()) -> Beacon | None:
     if len(flows) < min_connections:
         return None
 
@@ -152,7 +155,7 @@ def score_group(src: str, dst: str, dport: int, proto: int,
 
     return Beacon(
         src=src, dst=dst, dport=dport, proto=proto,
-        dst_scope=scope(dst),
+        dst_scope=scope(dst, local_nets),
         connections=len(flows),
         period=fit.period,
         jitter=fit.deviation,
@@ -307,11 +310,16 @@ _INTERNAL = tuple(ipaddress.ip_network(cidr) for cidr in (
 ))
 
 
-def scope(address: str) -> str:
+def scope(address: str, local_nets: Sequence = ()) -> str:
     """Classify a destination so a report can rank findings that timing cannot.
 
     A schedule reaching outside the network deserves an analyst's attention
     before an identical schedule to a host on their own subnet.
+
+    local_nets overrides the default ranges, because "inside" is a property of
+    the deployment and not of the address. A capture taken on an internet facing
+    server has no RFC 1918 addresses in it at all, and every address in it is
+    external by the default rule, which is exactly backwards.
     """
     try:
         parsed = ipaddress.ip_address(address)
@@ -323,10 +331,21 @@ def scope(address: str) -> str:
         return "multicast"
     if parsed.is_link_local:
         return "link-local"
-    if any(parsed in network for network in _INTERNAL
+    networks = local_nets or _INTERNAL
+    if any(parsed in network for network in networks
            if network.version == parsed.version):
         return "private"
     return "external"
+
+
+def is_local(address: str, local_nets: Sequence) -> bool:
+    """Whether an address belongs to the network the analyst declared as theirs."""
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return any(parsed in network for network in local_nets
+               if network.version == parsed.version)
 
 
 def _clamp(value: float) -> float:

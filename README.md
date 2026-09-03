@@ -30,6 +30,76 @@ sweep. Both are scripted, so both really are on a schedule. See
 [Limitations](#limitations); they are reported rather than suppressed, on
 purpose.
 
+## Validation on real malware traffic
+
+Generated traffic proves a detector against its author's assumptions and nothing
+more. These are public captures from
+[malware-traffic-analysis.net](https://www.malware-traffic-analysis.net), with
+published ground truth neither written nor influenced by this tool.
+
+### SSLoad into Cobalt Strike (2024-04-18)
+
+9,902 packets, 84 minutes, one infected Windows host. Published ground truth
+names the C2 at `85.239.53.219` and notes *"a scheduled task restarted the
+SSLoad DLL every ten minutes."*
+
+```
+pcapinator 2024-04-18-SSLoad-with-follow-up-Cobalt-Strike-DLL.pcap --local-net 10.4.18.0/24
+
+  [CRITICAL] Scheduled callbacks 10.4.18.169 -> 149.154.167.99:443
+        period                 600.0s +/- 5.0s        <- the ten minute task
+  [CRITICAL] Scheduled callbacks 10.4.18.169 -> 85.239.53.219:80
+        period                 198.3s +/- 4.5s        <- the published C2
+  [MEDIUM]   Scheduled callbacks 10.4.18.169 -> 10.4.18.4:135
+  [MEDIUM]   Scheduled callbacks 10.4.18.169 -> 10.4.18.4:49669
+```
+
+Both published C2 destinations found from timing alone, ranked above everything
+else, in 0.14 seconds. The two medium findings are Windows RPC to the domain
+controller, correctly scoped private. No other external destination was flagged.
+
+The ten minute schedule was recovered to within 5 seconds on the Telegram
+conversation. On the C2 itself the reported period is a third of the truth,
+because some check-ins open two connections:
+
+```
+gaps: [579.9, 601.8, 593.0, 228.0, 375.0, 600.1, 606.9, 430.0, 165.0, 595.0]
+                            \____ 603 ____/        \____ 595 ____/
+```
+
+The true period rejects those split gaps and explains only 6 of 10; the
+submultiple 600/3 folds nearly all of them and wins on agreement. Detection is
+unaffected and the conversation still ranks critical, but **the reported period
+is evidence to read, not a measurement to trust.** Pinned by a regression test
+using these exact gaps.
+
+The Cobalt Strike C2 at `193.32.176.22` is absent from the capture entirely, so
+its absence from the output is not a miss.
+
+### One week of internet-facing server traffic (2024-12-18)
+
+361,992 packets, 144 hours, 191,367 flows, analysed in under 4 seconds.
+
+631 scanning sources reported, including known mass-scan ranges
+(`92.255.85.0/24`, `89.248.165.0/24`, `162.142.125.0/24`). For an exposed server
+over a week that is the correct answer, not noise.
+
+This capture exposed a real design gap. Without a declared local network the
+tool reported **186 beacons, 165 of them inbound**: every scanner and monitoring
+service probing the server on a schedule. Beaconing means a host *inside* the
+network calling out, and a capture from an internet-facing server contains no
+RFC 1918 addresses at all, so the default rule calls every address external,
+including the server's own.
+
+`--local-net` fixes it, the same way Zeek and RITA take a local network
+definition:
+
+```
+                                    findings   beacons
+without --local-net                      817       186
+--local-net 203.161.44.208/32            652        21
+```
+
 ## Quick start
 
 ```bash
@@ -43,6 +113,10 @@ python -m venv .venv
 ./.venv/bin/pcapinator capture.pcapng
 ./.venv/bin/pcapinator capture.pcap.gz --only beacon,tunnel --threshold 0.8
 ./.venv/bin/pcapinator capture.pcap --json
+
+# say which addresses are yours, so beaconing means your hosts calling out
+./.venv/bin/pcapinator capture.pcap --local-net 10.0.0.0/8 --local-net 192.168.0.0/16
+./.venv/bin/pcapinator capture.pcap --top 20
 ```
 
 Exit status is `0` for no findings, `1` when findings are reported, `2` on
@@ -202,6 +276,11 @@ Stated because a detector without known limits has not been tested properly.
 - **Reputation-lookup services that encode hashes into subdomains** genuinely
   resemble DNS tunneling and are not separated.
 - **Encrypted DNS bypasses the DNS detectors entirely.** DoH is HTTPS.
+- **The reported beacon period can land on a submultiple** when a schedule opens
+  more than one connection per check-in, as measured on real SSLoad traffic
+  above. Detection is unaffected.
+- **Vantage point is not inferable.** On a capture with no RFC 1918 addresses,
+  every schedule looks outbound until `--local-net` says otherwise.
 - **A patient attacker evades the timing detectors** by beaconing slower than
   the capture window or randomising far beyond normal jitter, at the cost of
   responsiveness.
@@ -209,7 +288,7 @@ Stated because a detector without known limits has not been tested properly.
 ## Development
 
 ```bash
-./.venv/bin/python -m pytest          # 475 tests
+./.venv/bin/python -m pytest          # 509 tests
 ./.venv/bin/python tools/evaluate.py  # detection and false positive rates
 ```
 

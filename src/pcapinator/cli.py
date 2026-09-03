@@ -8,10 +8,11 @@ so a multi-gigabyte capture never has to be held in memory or read twice.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import sys
 from pathlib import Path
 
-from .detect.beacon import find_beacons
+from .detect.beacon import find_beacons, is_local
 from .detect.dga import find_dga
 from .detect.dnstunnel import find_tunnels
 from .detect.scan import find_scans
@@ -31,7 +32,8 @@ EXIT_ERROR = 2
 
 
 def analyse(path: str | Path, *, threshold: float = 0.7,
-            only: tuple[str, ...] = DETECTORS, strict: bool = False) -> Summary:
+            only: tuple[str, ...] = DETECTORS, strict: bool = False,
+            local_nets: tuple = ()) -> Summary:
     summary = Summary(capture=str(path))
     events: list = []
     span: list[float] = []
@@ -61,7 +63,16 @@ def analyse(path: str | Path, *, threshold: float = 0.7,
         summary.duration = max(span) - min(span)
 
     if "beacon" in only:
-        summary.findings += beacon_findings(find_beacons(flows, threshold=threshold))
+        beacons = find_beacons(flows, threshold=threshold, local_nets=local_nets)
+        if local_nets:
+            # Beaconing means a host inside the network calling out. Without a
+            # declared network there is no way to tell which side is which, so
+            # every schedule is reported; once the analyst says which addresses
+            # are theirs, an inbound schedule is someone else's probe. Pointed
+            # at an internet facing server this is the difference between four
+            # findings and a hundred and sixty five.
+            beacons = [b for b in beacons if is_local(b.src, local_nets)]
+        summary.findings += beacon_findings(beacons)
     if "scan" in only:
         summary.findings += scan_findings(find_scans(flows, threshold=threshold))
     if "tunnel" in only:
@@ -119,6 +130,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--strict", action="store_true",
                         help="fail on a truncated capture instead of reading "
                              "what is there")
+    parser.add_argument("--local-net", metavar="CIDR", action="append", default=[],
+                        help="network you own, repeatable. Restricts beaconing to "
+                             "hosts calling out from inside it, and decides which "
+                             "destinations count as external. Defaults to the "
+                             "RFC 1918 and RFC 6598 ranges")
+    parser.add_argument("--top", type=int, metavar="N",
+                        help="show only the N highest ranked findings")
     parser.add_argument("--no-color", action="store_true",
                         help="never colourise output")
     parser.add_argument("--demo", metavar="FILE",
@@ -131,6 +149,15 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("give a capture file, or --demo FILE to generate one")
     if not 0.0 <= args.threshold <= 1.0:
         parser.error("--threshold must be between 0 and 1")
+    if args.top is not None and args.top < 1:
+        parser.error("--top must be at least 1")
+
+    local_nets = []
+    for cidr in args.local_net:
+        try:
+            local_nets.append(ipaddress.ip_network(cidr, strict=False))
+        except ValueError as error:
+            parser.error(f"--local-net {cidr}: {error}")
 
     only = DETECTORS
     if args.only:
@@ -143,7 +170,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         summary = analyse(path, threshold=args.threshold, only=only,
-                          strict=args.strict)
+                          strict=args.strict, local_nets=tuple(local_nets))
     except CaptureError as error:
         print(f"pcapinator: {path}: {error}", file=sys.stderr)
         return EXIT_ERROR
@@ -155,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
         print(render_json(summary))
     else:
         colour = False if args.no_color else None
-        print(render_text(summary, colour=colour), end="")
+        print(render_text(summary, colour=colour, limit=args.top), end="")
 
     return EXIT_FINDINGS if summary.findings else EXIT_CLEAN
 

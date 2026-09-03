@@ -9,6 +9,16 @@ The false positive rate is the assertion that matters. A detector that fires on
 ordinary browsing is useless, so the benign set is deliberately stacked with the
 hard cases: consonant-heavy real names (npmjs, xkcd, wsj), non-English brands,
 short names, and names carrying digits.
+
+Browsing history is not what a capture is made of, so BENIGN is not enough.
+REAL_INFRA is the traffic an enterprise sensor actually sees - connectivity
+checks, CDN and ad-tech shorthand, nameserver zones, IoT back ends - and it is
+full of short consonant stacks that are indistinguishable from generated names
+under a bigram model. HOLDOUT_BENIGN was never consulted while choosing a weight
+or a ramp, so a zero there is evidence of separation rather than of fitting.
+
+Measured over all 558 benign names: no false positives, worst benign 0.49
+against a 0.55 threshold, recall 0.70, accuracy 0.92.
 """
 
 import importlib.util
@@ -19,9 +29,11 @@ from pathlib import Path
 
 import pytest
 
-from pcapinator.detect.bigrams import ALPHABET, INDEX, LOG_PROB
-from pcapinator.detect.dga import (DEFAULT_THRESHOLD, DgaScore, find_dga,
-                                   registrable, score_domain)
+from pcapinator.detect.bigrams import (ALPHABET, INDEX,
+                                       LETTER_LOG_PROB, LOG_PROB)
+from pcapinator.detect.dga import (CORRELATED_WEIGHTS, DEFAULT_THRESHOLD,
+                                   DgaScore, find_dga, registrable,
+                                   score_domain)
 from pcapinator.dnsview import DnsEvent
 
 SEED = 20240517
@@ -54,6 +66,57 @@ b2b mp3 utf8 ipv6 log4j sha256 base64 route53 7eleven w3schools""".split()
 # rather than pretending otherwise.
 WORDLIST_DGA = ["farmerpaper", "silverwinter", "coldmountain", "brokenletter",
                 "summerbottle", "yellowmarket", "quietgardenlight"]
+
+# Names an enterprise capture is full of and a browsing-history benign set is
+# not: connectivity checks, CDN and ad-tech shorthand, nameserver zones, IoT
+# back ends. They are consonant stacks, which is exactly what a DGA emits, so
+# they are the false positive class that decides whether this is deployable.
+REAL_INFRA = """msftncsi msftconnecttest lgtvsdp smtcdns jwpcdn nflxvideo nflximg
+nflxso mktdcdn tvrmsn grvcdn zbjimg adsrvr hdfcbank crwdcntrl fbcdn dwcdn wjcdn
+rlcdn krxd llnwd nstld ggpht ytimg akadns edgekey edgesuite bkrtx hdslb wsdvs
+vdcdn qhimg symcb symcd atdmt cctv sncf iqiyi youku snssdk wscdns ksyuncdn
+cvshealth zoomgov tiqcdn jsdelivr nordvpn expressvpn wsglb0 vscode-cdn bdstatic
+sinaimg alicdn pstatp bytecdn sohucs cnzz serving-sys casalemedia pubmatic
+rubiconproject 33across 3lift sovrn yieldmo taboola outbrain hsforms hsappstatic
+onetrust trustarc wnsc wcpo kcra wsoc wxyz kmov wusa9 knbc wnbc kabc wjla whdh
+wgn9 espncdn walgreens riteaid kroger albertsons gls-group trenitalia renfe
+dominos icicibank axisbank kotak paytm phonepe npci bhimupi airtel vodafone
+bouygtel swisscom proximus freenet strato hetzner scaleway contabo nfoservers
+softlayer globalsign sectigo entrust thawte geotrust sfdcstatic visualforce
+atl-paas githubusercontent githubassets jsonip ipify icanhazip whatismyip plivo
+messagebird kaspersky drweb bitdefender fortinet paloaltonetworks checkpoint
+sentinelone carbonblack tanium qualys rapid7 tenable splunkcloud sumologic
+loggly papertrailapp logz mixmax superhuman fastmail tutanota posteo runbox
+startpage ecosia qwant mojeek biorxiv medrxiv ssrn overleaf zotero mendeley
+mvnrepository jitpack jetbrains dnsmadeeasy ultradns dynect nsone stackpathdns
+edgecastcdn 1e100 gvt1 2mdn""".split()
+
+# Held out: never looked at while choosing a weight or a ramp, so a zero here is
+# evidence the separation generalises rather than evidence of a good fit.
+HOLDOUT_BENIGN = """wkbw wivb wgrz wham wroc wsyr wtvh wcax wmur wmtw wgme wcsh
+kptv kgw katu koin kxl kink kupn kold kvoa kgun kmsb scdn spotifycdn
+audioscrobbler lastfm bandcamp soundcloud mixcloud zscaler zscalertwo netskope
+forcepoint ironport websense mimecast proofpoint barracuda sonicwall watchguard
+cybs cybersource authorizenet braintreegateway adyen worldpay klarna afterpay
+affirm sezzle fastspring paddle ncr diebold verifone ingenico squareup toasttab
+lightspeedhq sabre amadeus travelport galileo worldspan sepa iso20022
+fixprotocol wgu snhu asu byu ucf fsu utexas umich uiuc gatech kth chalmers dtu
+ntnu aalto inria cnrs cea ipsl obspm polytechnique kek riken jaxa jaea nims
+aist naoj ictp usenix csail eecs mitre s4hana hcl wipro infosys tcs cognizant
+accenture capgemini deloitte kpmg mckinsey qlik tableau powerbi looker sisense
+domo microstrategy teradata cloudera hortonworks databricks snowflakecomputing
+mongodb couchbase cassandra scylladb influxdata timescale rabbitmq kafka pulsar
+nats zeromq activemq haproxy traefik envoyproxy istio linkerd consul nomad
+packer terraform vagrantup pulumi crossplane jenkins bamboo teamcity circleci
+travis-ci drone buildkite sonarsource sonarqube snyk whitesourcesoftware
+blackduck veracode hashicorp gruntwork spacelift scalr grsecurity kernelcare
+tuxcare cloudlinux imunify360 plesk cpanel directadmin ispconfig virtualmin
+webmin proxmox ovirt opennebula cloudstack truenas openmediavault unraid
+synology qnap asustor pfsense opnsense untangle ipfire smoothwall zabbix nagios
+icinga checkmk librenms observium cacti netbox nautobot phpipam infoblox bluecat
+efficientip solarwinds manageengine paessler whatsupgold""".split()
+
+ALL_BENIGN = BENIGN + SHORT_BENIGN + REAL_INFRA + HOLDOUT_BENIGN
 
 
 def _random(rng, alphabet, low, high):
@@ -123,21 +186,49 @@ def make_events(names, *, start=1000.0, step=0.5, responses=False):
 
 def test_no_benign_domain_is_flagged():
     flagged = [(label, round(score, 2))
-               for label, score in zip(BENIGN + SHORT_BENIGN,
-                                       scores(BENIGN + SHORT_BENIGN))
+               for label, score in zip(ALL_BENIGN, scores(ALL_BENIGN))
                if score >= DEFAULT_THRESHOLD]
     assert flagged == []
 
 
+def test_held_out_benign_names_are_not_flagged():
+    """Weights were never fitted against these, so this is the honest number."""
+    flagged = [(label, round(score, 2))
+               for label, score in zip(HOLDOUT_BENIGN, scores(HOLDOUT_BENIGN))
+               if score >= DEFAULT_THRESHOLD]
+    assert flagged == []
+
+
+@pytest.mark.parametrize("name", [
+    "msftncsi.com",      # every Windows host, on every network connect
+    "dns.msftncsi.com",
+    "msftconnecttest.com",
+    "hdfcbank.com",      # a bank, not a generator
+    "lgtvsdp.com",       # LG televisions phoning home
+    "mktdcdn.com", "smtcdns.net", "fbcdn.net", "crwdcntrl.net", "ggpht.com",
+])
+def test_ordinary_consonant_stacks_are_not_flagged(name):
+    """These are bigram-indistinguishable from DGA output. Firing on any of
+    them makes the detector unusable, whatever it scores on the malicious set."""
+    assert score_domain(name).score < DEFAULT_THRESHOLD, score_domain(name).describe()
+
+
+def test_correlated_letter_signals_cannot_reach_the_threshold_alone():
+    """Bigram fit and pronounceability measure one fact. An all-letter name that
+    maxes both and nothing else must stay unreported: that is what keeps every
+    short consonant stack in the benign corpus below the line."""
+    assert CORRELATED_WEIGHTS < DEFAULT_THRESHOLD
+
+
 def test_benign_scores_keep_margin_below_the_threshold():
     """Zero false positives is not enough; there has to be room to spare."""
-    worst = max(zip(scores(BENIGN + SHORT_BENIGN), BENIGN + SHORT_BENIGN))
+    worst = max(zip(scores(ALL_BENIGN), ALL_BENIGN))
     assert worst[0] <= DEFAULT_THRESHOLD - 0.05, worst
 
 
 def test_measured_accuracy_and_false_positive_rate():
     """Regression guard on the numbers this detector is claimed to achieve."""
-    benign = scores(BENIGN + SHORT_BENIGN)
+    benign = scores(ALL_BENIGN)
     malicious = [score for names in families().values() for score in scores(names)]
 
     false_positives = sum(score >= DEFAULT_THRESHOLD for score in benign)
@@ -147,15 +238,15 @@ def test_measured_accuracy_and_false_positive_rate():
     accuracy = (len(benign) - false_positives + true_positives) / (len(benign) + len(malicious))
 
     assert fpr == 0.0
-    assert recall >= 0.75, recall
-    assert accuracy >= 0.85, accuracy
+    assert recall >= 0.68, recall
+    assert accuracy >= 0.90, accuracy
 
 
 @pytest.mark.parametrize("family,floor", [
-    ("conficker", 0.75),
-    ("kraken", 0.95),
-    ("hex", 0.80),
-    ("alnum", 0.70),
+    ("conficker", 0.70),
+    ("kraken", 0.85),
+    ("hex", 0.90),
+    ("alnum", 0.75),
 ])
 def test_family_recall(family, floor):
     values = scores(families()[family])
@@ -164,10 +255,33 @@ def test_family_recall(family, floor):
 
 
 def test_short_random_names_are_the_documented_weak_case():
-    """Six to eight random letters is where this method runs out of evidence."""
+    """Six to eight random letters is where this method runs out of evidence.
+    A seven-character consonant stack is the same object whether LG registered
+    it or a generator emitted it, so recall here is near zero on purpose."""
     values = scores(families()["short"])
     recall = sum(score >= DEFAULT_THRESHOLD for score in values) / len(values)
-    assert 0.25 <= recall < 0.75, recall
+    assert recall < 0.25, recall
+
+
+def test_a_seven_letter_generated_name_is_indistinguishable_from_lgtvsdp():
+    """The reason short recall is abandoned rather than tuned. These two differ
+    only in who registered them."""
+    benign = score_domain("lgtvsdp.com")
+    generated = score_domain("gbpplvl.com")
+    assert abs(benign.score - generated.score) < 0.12
+    assert max(benign.score, generated.score) < DEFAULT_THRESHOLD
+
+
+def test_syllable_generators_evade_lexical_scoring():
+    """Alternating consonants and vowels costs an attacker nothing and produces
+    pronounceable names built from ordinary letters. Lexical scoring cannot see
+    them; this pins the cheapest available evasion as a known miss."""
+    rng = random.Random(SEED)
+    consonants, vowels = "bcdfghjklmnprstvwz", "aeiou"
+    names = ["".join(rng.choice(consonants) + rng.choice(vowels)
+                     for _ in range(rng.randint(4, 6))) for _ in range(60)]
+    caught = sum(score >= DEFAULT_THRESHOLD for score in scores(names))
+    assert caught / len(names) < 0.10, caught
 
 
 def test_wordlist_dga_is_not_detected():
@@ -338,6 +452,24 @@ def test_hostile_names_survive_find_dga():
     assert all(0.0 <= result.score <= 1.0 for result in found)
 
 
+def test_a_repeated_character_is_not_generated_output():
+    """A run of one character is the least random string there is. The bigram
+    model still dislikes "aa", so without a check on how much distinct material
+    the name actually carries it scores like a long generated name."""
+    for name in ["aaaaaaaaaa.com", "wwwwwwwwwwwwwwww.net", "a" * 63 + ".org",
+                 "abababababababab.com"]:
+        result = score_domain(name)
+        assert result.score < DEFAULT_THRESHOLD, result.describe()
+
+
+def test_the_length_limit_is_not_bypassed_by_a_bare_label():
+    """registrable() rejects names over 255 octets. The bare-label path has to
+    reject them too, or the same string is unscorable with a suffix and scored
+    without one."""
+    assert score_domain("a" * 300) is None
+    assert score_domain("deadbeef1234" * 25) is None
+
+
 def test_random_bytes_as_names_never_raise():
     rng = random.Random(SEED)
     for _ in range(500):
@@ -368,6 +500,13 @@ def test_table_shape_and_normalisation():
         assert len(row) == 27
         assert all(value < 0 for value in row)
         assert sum(math.exp(value) for value in row) == pytest.approx(1.0, abs=1e-3)
+
+
+def test_letter_marginals_are_a_distribution_that_ranks_english():
+    assert len(LETTER_LOG_PROB) == 26
+    assert sum(math.exp(value) for value in LETTER_LOG_PROB) == pytest.approx(1.0, abs=1e-3)
+    index = lambda char: LETTER_LOG_PROB[ord(char) - 97]
+    assert index("e") > index("s") > index("k") > index("q")
 
 
 def test_unseen_pairs_are_penalised_but_finite():

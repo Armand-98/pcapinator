@@ -23,8 +23,11 @@ the data. That is measured directly, as information capacity per query:
                     discriminant: a 16 character CDN hash carries ~60 bits, a
                     single base32 label carries ~300
 
-Capacity gates the verdict, scaled by how nearly unique the subdomains are, and
-the supporting signals modulate it within SUPPORT_FLOOR:
+Capacity gates the verdict, scaled by cardinality, and the supporting signals
+modulate it within SUPPORT_FLOOR. Cardinality is the larger of two readings of
+the same idea: the share of queries that named something new, and the distinct
+content the parent has carried in total. The ratio alone is an attacker's to
+dilute, since re-asking a name is free; the total is not.
 
   query type skew   TXT, NULL and CNAME carry the most data back
   NXDOMAIN ratio    high for tunnels whose server answers out of band, and
@@ -33,8 +36,10 @@ the supporting signals modulate it within SUPPORT_FLOOR:
   upload volume     estimated bytes encoded in query names, which is the number
                     an incident responder actually wants
 
-Estimated upload is information theoretic, sum(len * entropy) / 8, rather than
-assuming an encoding, so it stays a lower bound for base32 and base64 alike.
+Estimated upload is information theoretic, distinct names * len * entropy / 8,
+rather than assuming an encoding, so it stays a lower bound for base32 and
+base64 alike. A name asked twice is counted once, because the second answer
+comes from a cache and carries nothing.
 
 Benign patterns deliberately tested against (tests/test_dnstunnel.py):
 
@@ -240,13 +245,18 @@ class _Domain:
 def _group(events: Iterable[DnsEvent]) -> dict[str, _Domain]:
     domains: dict[str, _Domain] = {}
     for event in events:
-        parent = event.parent
+        # DNS labels are case insensitive (RFC 4343), so case is not evidence
+        # of anything and must not be allowed to split a domain. Left as is it
+        # is an evasion in one line of attacker code, and it fires on any
+        # capture taken upstream of a resolver using 0x20 encoding, where every
+        # name arrives randomly cased.
+        labels = [label.lower() for label in event.labels]
+        if len(labels) < 3:
+            continue
+        parent = ".".join(labels[-2:])
         # Locally scoped namespaces have no attacker-reachable authority, so
         # they are excluded by structure rather than by score.
-        if not parent or parent.rsplit(".", 1)[-1] in LOCAL_SCOPE:
-            continue
-        labels = event.labels
-        if len(labels) < 3:
+        if labels[-1] in LOCAL_SCOPE:
             continue
 
         domain = domains.get(parent)
