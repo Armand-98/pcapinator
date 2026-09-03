@@ -106,17 +106,21 @@ without --local-net                      817       186
 python -m venv .venv
 ./.venv/bin/pip install -e ".[dev]"
 
-# generate a labelled capture containing every threat plus its benign twin
-./.venv/bin/pcapinator --demo demo.pcap
+# optional: make it callable from anywhere, as pcapinator or pcapi
+tools/install.sh                    # links into /opt/homebrew/bin
+tools/install.sh ~/.local/bin       # or anywhere else on PATH
 
-# analyse your own
-./.venv/bin/pcapinator capture.pcapng
-./.venv/bin/pcapinator capture.pcap.gz --only beacon,tunnel --threshold 0.8
-./.venv/bin/pcapinator capture.pcap --json
+# generate a labelled capture containing every threat plus its benign twin
+pcapinator --demo demo.pcap
+
+# analyse your own. pcapi is the same command, abbreviated
+pcapinator capture.pcapng
+pcapi capture.pcap.gz --only beacon,tunnel --threshold 0.8
+pcapi capture.pcap --json
 
 # say which addresses are yours, so beaconing means your hosts calling out
-./.venv/bin/pcapinator capture.pcap --local-net 10.0.0.0/8 --local-net 192.168.0.0/16
-./.venv/bin/pcapinator capture.pcap --top 20
+pcapi capture.pcap --local-net 10.0.0.0/8 --local-net 192.168.0.0/16
+pcapi capture.pcap --top 20
 ```
 
 Exit status is `0` for no findings, `1` when findings are reported, `2` on
