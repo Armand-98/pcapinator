@@ -16,7 +16,9 @@ the data. That is measured directly, as information capacity per query:
   name length       encoded payload makes the varying part far longer than a
                     hostname anyone would type
   Shannon entropy   per character, over the varying labels. base32/base64 data
-                    sits near 5 bits, hex near 4, real hostnames near 3
+                    sits near 5 bits, hex near 4, real hostnames near 3. It is
+                    a factor of capacity, never a gate on its own: a floor on
+                    it is escaped by encoding in a smaller alphabet
   capacity          length * entropy, the bits a query can smuggle. This is the
                     discriminant: a 16 character CDN hash carries ~60 bits, a
                     single base32 label carries ~300
@@ -40,10 +42,21 @@ Benign patterns deliberately tested against (tests/test_dnstunnel.py):
                              one parent. Cardinality is maximal, capacity is
                              not: the names are short and drawn from a small
                              alphabet
-  reverse DNS sweeps         .arpa parents are excluded outright. Their labels
-                             are numeric and structurally constrained, so they
-                             are not an exfiltration channel; scoring them
-                             would only produce noise on any subnet sweep
+  reverse DNS sweeps         .arpa parents are excluded outright, along with
+                             every other namespace whose resolution never
+                             leaves the local scope (see LOCAL_SCOPE). A tunnel
+                             needs an authoritative server the attacker
+                             controls, and no name under .arpa, .local or
+                             .internal has one; scoring them only produces
+                             noise on subnet sweeps, Bonjour chatter and
+                             container DNS
+  mDNS/Bonjour chatter       instance names under _tcp.local carry device
+                             UUIDs and MAC addresses, so they reach tunnel
+                             capacity. Excluded by scope: mDNS is answered on
+                             the link, never by an attacker's nameserver
+  container/cluster DNS      generated pod names under cluster.local are long,
+                             unique per pod and near maximal entropy. Same
+                             exclusion, since cluster.local is under .local
   DGA traffic                one query per registered domain, so a DGA never
                              reaches MIN_QUERIES under a shared parent. Also
                              tested for DGAs hung off a dynamic DNS parent,
@@ -52,11 +65,29 @@ Benign patterns deliberately tested against (tests/test_dnstunnel.py):
                              over TXT, answered NXDOMAIN
   long descriptive names     long but low entropy, and queried repeatedly
 
-Known limitation: reputation services that encode a SHA-256 into one label are
-not separable from a tunnel by content. 64 hex characters is ~250 bits per
-query, the same capacity as a real tunnel, sent to a fixed parent at a steady
-rate. Separating those needs a domain allowlist, which is deployment data and
-deliberately not baked in here.
+Known limitations, all pinned by tests so they cannot regress into silent
+claims:
+
+  content addressed names   any service that names a host after a hash or a
+                            long random identifier is not separable from a
+                            tunnel by content: SHA-256 reputation lookups and
+                            IPFS subdomain gateways both put ~250 bits of
+                            near-maximal-entropy data in a label sent to a
+                            fixed parent. Separating those needs a domain
+                            allowlist, which is deployment data and
+                            deliberately not baked in here
+  low capacity chunking     a tunnel that keeps under BITS_FLOOR per query
+                            evades the capacity gate, at roughly 11 bytes a
+                            query. That region also contains every CDN, GUID
+                            and session hostname on the internet, so it cannot
+                            be reclaimed by lowering the gate
+  duplicate padding         cardinality is a ratio, so re-asking each encoded
+                            name a few times dilutes it. It cannot dilute it
+                            to nothing: novelty measures the distinct data a
+                            parent has carried, which padding cannot reduce
+  public suffixes           grouping is on the last two labels, so a tunnel
+                            under example.co.uk merges with its neighbours.
+                            No public suffix list is bundled; that is data
 """
 
 from __future__ import annotations
@@ -74,17 +105,38 @@ MIN_UNIQUE = 8
 
 DATA_QTYPES = frozenset({QTYPE_TXT, QTYPE_NULL, QTYPE_CNAME})
 
+# Namespaces whose resolution never leaves the local scope, so no attacker
+# controlled nameserver can be on the other end of a query and no exfiltration
+# channel exists however encoded the names look. Excluded structurally rather
+# than by score: .arpa carries reverse sweeps, .local carries mDNS/Bonjour
+# instance names and Kubernetes cluster.local, .internal carries cloud and
+# container hostnames. Reserved-but-ordinarily-resolved names (.test,
+# .example) are deliberately not here, since a resolver treats them like any
+# other name.
+LOCAL_SCOPE = frozenset({"arpa", "local", "localhost", "internal", "invalid",
+                         "onion", "alt"})
+
 # Bits per query below which the name cannot be carrying meaningful payload,
-# and above which it is carrying as much as a tunnel bothers to send.
+# and above which it is carrying as much as a tunnel bothers to send. This is
+# the gate: below the floor the domain is not scored at all, because capacity
+# is the one thing a tunnel cannot trade away.
 BITS_FLOOR = 90.0
 BITS_CEIL = 240.0
-# Under this, the varying labels are not encoded data: numeric, dictionary or
-# too short to be anything else.
-ENTROPY_FLOOR = 3.3
+# Per-character entropy of an ordinary hostname, the reference the reported
+# entropy_score is measured against. Entropy is deliberately not a gate of its
+# own: gating on it rejects any low-alphabet encoding outright, so a tunnel
+# escapes the detector entirely by encoding in base 8 rather than base 32. What
+# matters is what a name can carry, and capacity already prices the alphabet.
+ENTROPY_BASE = 3.3
 
 # Distinct subdomains per query. Benign clients revisit names; a tunnel cannot.
 UNIQUE_FLOOR = 0.40
 UNIQUE_SPAN = 0.50
+# Revisiting only exculpates a parent that has few distinct names to revisit.
+# Once it has served this many bytes of distinct encoded content, re-asking
+# those names says nothing, so padding a tunnel with duplicate queries cannot
+# dilute cardinality to zero.
+NOVEL_CEIL = 4096.0
 
 # Share of queries a label position must agree on to count as routing rather
 # than payload.
@@ -189,9 +241,9 @@ def _group(events: Iterable[DnsEvent]) -> dict[str, _Domain]:
     domains: dict[str, _Domain] = {}
     for event in events:
         parent = event.parent
-        # Reverse lookups group into one enormous, entirely benign pseudo
-        # domain. They are excluded by structure, not by score.
-        if not parent or parent.endswith("arpa"):
+        # Locally scoped namespaces have no attacker-reachable authority, so
+        # they are excluded by structure rather than by score.
+        if not parent or parent.rsplit(".", 1)[-1] in LOCAL_SCOPE:
             continue
         labels = event.labels
         if len(labels) < 3:
@@ -239,17 +291,22 @@ def score_domain(parent: str, domain: _Domain, window: float, *,
         return None
 
     entropy = sum(_entropy(text) for text in encoded) / len(encoded)
-    if entropy < ENTROPY_FLOOR:
+    bits = name_len * entropy
+    if bits < BITS_FLOOR:
         return None
 
-    bits = name_len * entropy
-    # Scaled up from the retained sample, which is capped for hostile captures.
-    upload_bytes = int(bits / 8 * domain.queries)
+    # A repeated name carries no new data, so the estimate counts distinct ones
+    # and scales that back up from the retained sample, which is capped for
+    # hostile captures.
+    novel = len(subs) * domain.queries / len(records)
+    upload_bytes = int(bits / 8 * novel)
 
     unique_ratio = len(subs) / len(records)
-    cardinality_score = _clamp((unique_ratio - UNIQUE_FLOOR) / UNIQUE_SPAN)
+    novelty_score = _clamp(len(subs) * bits / 8 / NOVEL_CEIL)
+    cardinality_score = max(_clamp((unique_ratio - UNIQUE_FLOOR) / UNIQUE_SPAN),
+                            novelty_score)
     length_score = _clamp((name_len - 15.0) / 45.0)
-    entropy_score = _clamp((entropy - ENTROPY_FLOOR) / 1.5)
+    entropy_score = _clamp((entropy - ENTROPY_BASE) / 1.5)
     capacity_score = _clamp((bits - BITS_FLOOR) / (BITS_CEIL - BITS_FLOOR))
 
     data_queries = sum(1 for record in records if record.qtype in DATA_QTYPES)

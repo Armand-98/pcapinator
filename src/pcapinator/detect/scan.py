@@ -88,11 +88,21 @@ Known false positive classes this cannot separate on traffic shape alone:
   an empty TCP session torn down with a RST rather than a FIN, which leaves the
   same trace as a stealth probe of an open port: one packet back and no data.
   A health checker that aborts instead of closing lands here
+  a router or firewall emitting ICMP errors, whether time-exceeded to a run of
+  traceroutes or administratively-prohibited to every host it is blocking. A
+  flow carries no ICMP type, so an error sent to forty hosts and an echo request
+  sent to forty hosts are identical on every field there is, and the ping sweep
+  is worth more than the false positive costs
 
 What defeats it. The axes are per source, so an attacker who splits a sweep
 across several sources, or who takes fewer than MIN_FANOUT ports from each host
 and a different set per host, keeps every group under the floor and is not
-reported. Rate limiting alone does not work, since timing is only support.
+reported. Rate limiting alone does not work, since timing is only support. And
+a UDP sweep whose probes carry a protocol payload is scored as a data push and
+missed: a Wake-on-LAN magic packet and an SNMP version probe are the same
+hundred unanswered bytes sent wide, and a flow record holds nothing that tells
+them apart. Empty probes, which is what a UDP port sweep sends to every port
+there is no protocol probe for, are still caught.
 
 A sweep of many hosts on many ports is reported twice, once per host as a
 vertical result and once per port as a horizontal result. Both statements are

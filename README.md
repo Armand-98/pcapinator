@@ -209,7 +209,7 @@ Stated because a detector without known limits has not been tested properly.
 ## Development
 
 ```bash
-./.venv/bin/python -m pytest          # 466 tests
+./.venv/bin/python -m pytest          # 475 tests
 ./.venv/bin/python tools/evaluate.py  # detection and false positive rates
 ```
 

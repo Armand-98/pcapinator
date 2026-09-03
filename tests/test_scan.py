@@ -357,3 +357,115 @@ def test_answered_connections_are_served_even_when_the_server_sends_no_data():
     scored = find_scans(flows, threshold=0.0)
     assert all(s.response_score == 0.0 for s in scored), (
         "nothing went unserved, so the unserved share must be zero")
+
+
+# --- sessions and streams that carry no server payload ---------------------
+#
+# Every generator below is wide, fast and answered by no data at all, which is
+# the whole of the scan signal if "unanswered" is read as "returned nothing".
+# None of them is a search for a service that is not there.
+
+EMPTY_SESSION = 0x02 | 0x10 | 0x01   # SYN, ACK, FIN and not one byte of data
+PUSH = 0x08 | 0x10                   # mid-capture: the handshake is not in the file
+
+
+def health_checks(hosts=40, rounds=12, *, base=11000.0):
+    """A load balancer TCP checking every backend every five seconds."""
+    return [flow("10.0.1.5", f"10.0.2.{host}", 8080,
+                 base + round_ * 5.0 + host * 0.01, flags=EMPTY_SESSION,
+                 payload_out=0, payload_in=0, duration=0.01)
+            for round_ in range(rounds) for host in range(hosts)]
+
+
+def bulk_upload(hosts=20, *, base=12000.0, flags=SESSION):
+    """A log shipper or backup client pushing to storage nodes. The peer sends
+    nothing but ACKs, so there is no inbound payload anywhere in the fan-out."""
+    return [flow("10.0.1.6", f"10.0.3.{host}", 9000, base + host * 0.3,
+                 flags=flags, payload_out=4_000_000, payload_in=0, duration=8.0)
+            for host in range(hosts)]
+
+
+def multicast_stream(groups=30, *, base=13000.0):
+    """A market data or video source fanning out to multicast groups: one way,
+    thirty destinations on one port, and nothing ever answers a multicast."""
+    return [flow("10.0.1.7", f"239.1.2.{group}", 5004, base + group * 0.02,
+                 proto=17, responded=False, flags=0, payload_out=1_400_000,
+                 duration=30.0)
+            for group in range(groups)]
+
+
+def fragmented_replies(clients=50, *, base=14000.0):
+    """Fragments carry no ports, so a server's large UDP answers form their own
+    port-0 flows out to every client: a horizontal sweep on port 0 by shape."""
+    return [flow("10.0.1.8", f"10.0.4.{client}", 0, base + client * 0.05,
+                 proto=17, responded=False, flags=0, payload_out=2800,
+                 duration=0.001)
+            for client in range(clients)]
+
+
+def wake_on_lan(hosts=40, *, base=15000.0):
+    """A management host waking a fleet: wide, fast, one way, and answered by
+    nothing at all. Only the payload separates it from a UDP sweep."""
+    return [flow("10.0.1.9", f"10.0.8.{host}", 9, base + host * 0.05, proto=17,
+                 responded=False, flags=0, payload_out=102, duration=0.0)
+            for host in range(hosts)]
+
+
+def test_tcp_health_checks_are_not_a_scan():
+    """480 empty connections over 40 backends. The handshake completing is the
+    only evidence that the port was open, and it has to be enough."""
+    assert find_scans(health_checks()) == []
+
+
+def test_one_way_upload_fanout_is_not_a_scan():
+    assert find_scans(bulk_upload()) == []
+
+
+def test_upload_whose_handshake_predates_the_capture_is_not_a_scan():
+    assert find_scans(bulk_upload(base=12500.0, flags=PUSH)) == []
+
+
+def test_multicast_stream_is_not_a_scan():
+    assert find_scans(multicast_stream()) == []
+
+
+def test_fragmented_udp_replies_are_not_a_scan():
+    assert find_scans(fragmented_replies()) == []
+
+
+def test_wake_on_lan_sweep_is_not_a_scan():
+    assert find_scans(wake_on_lan()) == []
+
+
+def test_none_of_the_payload_free_traffic_fires_together():
+    flows = (health_checks() + bulk_upload() + multicast_stream()
+             + fragmented_replies() + wake_on_lan() + browsing())
+    assert find_scans(flows) == []
+    scan = only(find_scans(flows + horizontal_sweep(hosts=60, dport=3389)))
+    assert scan.src == SCANNER
+
+
+def test_a_lone_syn_ack_is_not_a_served_session():
+    """A stealth scan of a host whose ports are all open draws one SYN-ACK per
+    probe and nothing else. One packet back is what a refusal looks like too, so
+    it cannot count as service, or the scan disappears."""
+    flows = [Flow(key=FlowKey(6, SCANNER, 40000 + port, VICTIM, port),
+                  start=16000.0 + port * 0.01, end=16000.0 + port * 0.01,
+                  packets_out=1, packets_in=1, bytes_out=60, bytes_in=60,
+                  payload_out=0, payload_in=0,
+                  flags_seen=0x02 | 0x10, responded=True)
+             for port in range(1, 121)]
+    scan = only(find_scans(flows))
+    assert scan.response_score == 1.0
+    assert scan.score > 0.9
+
+
+def test_udp_sweep_with_empty_probes_is_detected():
+    """The payload gate is a gate, not a veto: nmap sends an empty datagram to
+    every UDP port it has no protocol probe for, which is most of them."""
+    scan = only(find_scans(
+        [flow(SCANNER, VICTIM, port, 17000.0 + port * 0.01, proto=17,
+              responded=False, flags=0, payload_out=0, duration=0.0)
+         for port in range(1, 200)]))
+    assert scan.kind == VERTICAL
+    assert scan.score > 0.9
