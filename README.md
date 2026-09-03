@@ -110,6 +110,9 @@ python -m venv .venv
 tools/install.sh                    # links into /opt/homebrew/bin
 tools/install.sh ~/.local/bin       # or anywhere else on PATH
 
+# run with no arguments for a menu, or use the flags below directly
+pcapinator
+
 # generate a labelled capture containing every threat plus its benign twin
 pcapinator --demo demo.pcap
 
@@ -292,7 +295,7 @@ Stated because a detector without known limits has not been tested properly.
 ## Development
 
 ```bash
-./.venv/bin/python -m pytest          # 509 tests
+./.venv/bin/python -m pytest          # 531 tests
 ./.venv/bin/python tools/evaluate.py  # detection and false positive rates
 ```
 

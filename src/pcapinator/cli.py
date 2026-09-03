@@ -18,6 +18,8 @@ from .detect.dnstunnel import find_tunnels
 from .detect.scan import find_scans
 from .dnsview import dns_event
 from .flows import assemble
+from .menu import TUTORIAL, ask, clean_path, interactive
+from .menu import run as run_menu
 from .layers import decode
 from .pcap import CaptureError, read_packets
 from .report import (Summary, beacon_findings, dga_findings, render_json,
@@ -113,6 +115,43 @@ def demo_capture(path: Path) -> Path:
     ).write(path)
 
 
+def _menu_action(_number: int, entry) -> int | None:
+    """Run one menu choice. Returning None sends the user back to the menu."""
+    name, _blurb, only = entry
+
+    if name == "Tutorial":
+        print(TUTORIAL)
+        return None
+
+    if name == "Demo":
+        target = ask("Write the demo capture to", "demo.pcap")
+        if not target:
+            return None
+        path = demo_capture(Path(clean_path(target)))
+        print(f"   wrote {path}")
+    else:
+        answer = ask("Capture file")
+        if not answer:
+            return None
+        path = Path(clean_path(answer))
+        if not path.is_file():
+            print(f"   no such file: {path}")
+            return None
+
+    try:
+        summary = analyse(path, only=only or DETECTORS)
+    except CaptureError as error:
+        print(f"   {path}: {error}")
+        return None
+    except OSError as error:
+        print(f"   {error}")
+        return None
+
+    print()
+    print(render_text(summary))
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="pcapinator",
@@ -146,6 +185,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if not args.capture and not args.demo:
+        # A terminal gets the menu. A pipe or a script gets the error, because
+        # a prompt nobody is there to answer is worse than a clear failure.
+        if interactive() and argv is None:
+            return run_menu("pcapinator", _menu_action)
         parser.error("give a capture file, or --demo FILE to generate one")
     if not 0.0 <= args.threshold <= 1.0:
         parser.error("--threshold must be between 0 and 1")
